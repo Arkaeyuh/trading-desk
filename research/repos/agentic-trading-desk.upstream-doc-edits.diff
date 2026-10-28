@@ -1,0 +1,80 @@
+diff --git a/.gitignore b/.gitignore
+index c18dd8d..e15c121 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,5 @@
+ __pycache__/
++backtest/data/
++backtest/results/*/
++backtest/data_pit/
++backtest/universe_src/
+diff --git a/README.md b/README.md
+index e44888d..f9e7d8c 100644
+--- a/README.md
++++ b/README.md
+@@ -30,6 +30,8 @@ graph TD
+ *   **[scripts/macro_pillar.py](scripts/macro_pillar.py)**: Macro regime detector and cross-asset sentiment scorer.
+ *   **[scripts/score.py](scripts/score.py)**: Evaluator of the three-pillar framework and exit/entry decision engine.
+ *   **[scripts/prepare_inputs.py](scripts/prepare_inputs.py)**: Turns raw Robinhood MCP output into script inputs — drops interpolated bars and appends today's close (Step 0) from the broker's own dates.
++*   **[scripts/codex_review.py](scripts/codex_review.py)**: Second-opinion gate — builds the blind/reveal prompts for an independent Codex review of each buy and applies a fixed skip/halve/proceed policy.
++*   **[backtest/](backtest/)**: Walk-forward backtest of the deterministic layer under the Mandate's sizing rules, with a random-entry null model and a per-signal event study. See [backtest/README.md](backtest/README.md).
+ *   **[scripts/session-setup.sh](scripts/session-setup.sh)**: Installs `jq` and proves the order guard is alive (15 probes per guard copy, plus a sync check of the user-level copy).
+ *   **[hooks/mandate-order-guard.sh](hooks/mandate-order-guard.sh)** + **[.claude/settings.json](.claude/settings.json)**: `PreToolUse` guard that enforces the Mandate's order rules outside the model.
+ *   **[gemini-spark/](gemini-spark/)**: Sanitized version of the skill and scripts compatible with Gemini Spark security policies. The scripts are identical copies of `scripts/` and the order-type rules match the main skill; the intentional difference is that the Spark version allows **zero discretion** (only `score.py` decisions are executable) and does not ship the order-guard hook.
+@@ -228,7 +230,8 @@ To complement the purely technical nature of the deterministic scripts, the AI a
+ 3.  **Buying Power**: Always taken from `get_portfolio.buying_power` rather than derived. Account type matters and can change: a cash account settles T+1, while a limited-margin account can trade unsettled proceeds immediately.
+ 4.  **Mandatory Simulation**: Every order passes through `review_*_order` with the exact parameters before `place_*_order`. The trade is aborted and reported if the review returns any `order_checks` alert, or if its quote is more than 1% away from the price the analysis used (a dollar-sized market order's review has no fill price or share count to compare). An order that comes back `customer_approval_required` is reported as pending approval, not executed.
+ 5.  **Mandate Limits Are Hard**: A limit exceeded is not a prompt to ask for permission — it is a stop. The agent does not trade and reports why. Circuit breakers halt new buys if the account is down more than 4% on the day, or if the data does not reconcile.
+-6.  **No Backtest**: This framework has not been backtested. A trigger firing does not make it correct. Set the Mandate limits to a size where being wrong is survivable.
++6.  **Backtest Shows No Edge (Yet)**: The deterministic layer is backtested in [`backtest/`](backtest/README.md). Over 2008–2026 on 30 liquid stocks/ETFs it made money (+2.0% CAGR at ~24% average exposure, max drawdown −6.6%) but **less than random entries into the same names for the same holding periods** (1st percentile of 500 random runs), and its EXIT signals were followed by above-average returns. The result holds on a point-in-time S&P 500 universe with delisted names (0th–1st percentile in both 2008–2016 and 2017–2026). A trigger firing does not make it correct. Set the Mandate limits to a size where being wrong is survivable.
++7.  **Codex Review Gate**: Every buy is reviewed by an independent Codex session before it is placed (blind first, then shown the proposal). Codex can skip or halve a buy, never enlarge or originate one; with no reachable Codex, buys are skipped. See *Second Opinion — Codex Review* in [SKILL.md](SKILL.md). To register the server for this project, copy `.mcp.json.example` to `.mcp.json` (or `claude mcp add codex -- codex mcp-server`).
+ 
+ ---
+ 
+diff --git a/SKILL.md b/SKILL.md
+index 5288201..f4444b1 100644
+--- a/SKILL.md
++++ b/SKILL.md
+@@ -39,6 +39,7 @@ The user authorizes executing orders without in-the-moment confirmation, **only*
+ - **Discretionary entries and exits are authorized** (established by the user in a live session on 2026-08-26, superseding the prior zero-discretion rule): a trend change, a news catalyst, or a setup the decision cascade does not cover are all valid reasons to act. The cascade is rigid by design and will miss things; that is what this clause is for.
+ - Every discretionary trade MUST carry its reasoning in writing in the session report — what I saw, why it justified acting, and what would prove me wrong. A trade I cannot explain in two sentences is a trade I should not have made.
+ - **TACTICAL REBOUND goes in at half size** — it is counter-trend by definition.
++- **Every buy — framework or discretionary — passes the Codex review gate first** (*Second Opinion — Codex Review* below). The gate can skip or halve a buy; it can never enlarge one or originate one. Sells are reviewed but not gated.
+ - Optional: for a news-driven entry, require the tape to be moving in the direction of the thesis before acting rather than anticipating the move. Rationale in *External Context* below — in scheduled runs the news source is the weakest input available, and price confirmation is the cheapest guard against acting on a mis-dated headline.
+ 
+ **Hard limits**
+@@ -62,6 +63,7 @@ The user authorizes executing orders without in-the-moment confirmation, **only*
+   | sizing | … | exactly one · buys `dollar_amount` · sells `dollar_amount` or `quantity` |
+   | `time_in_force` | … | explicitly `gfd` |
+   | notional (buys) | `dollar_amount` | ≤ 3% of account value and ≤ $1,200 |
++  | Codex gate (buys) | `gate` · `approved_dollar_amount` | `PROCEED` or `REDUCE`, and `dollar_amount` ≤ `approved_dollar_amount` (otherwise: no order) |
+ - **The guard fails closed.** Without `jq`, with an unparseable payload, or with an unreadable clock it denies; the registered hook command wraps it so a missing or crashing script exits 2, which blocks the call (a plain non-zero exit would be a non-blocking error, i.e. ALLOW). Even so, I treat the preflight table above as the real check, not the hook — see *Session start* below for where the hook does and does not run.
+ - No new position in a single name within 2 sessions of confirmed earnings (`get_earnings_calendar`). ETFs exempt.
+ - I run `review_equity_order` with the exact parameters before every `place_equity_order`. **I abort and report** if `order_checks` is non-empty (I surface the alert verbatim), or if `quote_data.last_trade_price` is more than 1% away from the price the analysis used. A dollar-sized market order's review returns no share quantity or fill price — the quote is what I check. If the review returns `customer_approval_required: true`, the order goes to the user for approval in the Robinhood app: I report it as *pending approval*, not as executed.
+@@ -154,6 +156,20 @@ This returns the three-pillar scorecard + decision (EXIT / TRIM, EXIT, RE-ENTRY
+ 
+ If only raw indicators are needed: `python3 scripts/indicators.py ticker_input.json`.
+ 
++## Second Opinion — Codex Review (before every buy)
++
++A second, independent model reviews each proposed buy through the Codex MCP server (tools `mcp__<server>__codex` and `mcp__<server>__codex-reply`; load them with `tool_search`). `scripts/codex_review.py` builds the prompts and applies the policy — I only relay text, and I never paraphrase or trim a prompt or a reply.
++
++1. **Blind stage.** `python3 scripts/codex_review.py blind --ticker <workdir>/ticker_<SYM>.json --macro-score <pillar_score> --holding <true|false> --macro-file <workdir>/macro_input.json --evidence <skill-dir>/backtest/results/summary.json` → pass the output verbatim as `prompt` to `codex` with `sandbox: "read-only"` and `cwd: <skill-dir>`. Codex reruns `score.py` itself and states its own stance **before it sees mine**. Save the reply to `<workdir>/codex_blind_<SYM>.txt` and keep the `threadId`.
++2. **Reveal stage.** Write the order to `<workdir>/order_<SYM>.json` (`{"symbol","side","dollar_amount","action"}`; `action` is the score.py action or `DISCRETIONARY`), then `python3 scripts/codex_review.py reveal --order <that file> --rationale "<my written reasoning: what I saw, why, what proves me wrong>" --evidence …` → send it with `codex-reply` on the same `threadId`. Save the reply to `<workdir>/codex_final_<SYM>.txt`.
++3. **Gate.** `python3 scripts/codex_review.py check --order … --blind … --final … --ledger <workdir>/codex_ledger.jsonl`. Exit 0 → `PROCEED` (proposed size) or `REDUCE` (half): I use `approved_dollar_amount` as the order's `dollar_amount`. Exit 3 → `SKIP`: no order; I report Codex's reasons verbatim.
++
++Rules:
++- **Fail closed for buys.** No Codex tool in this client, a timeout, or an unparseable reply → `SKIP`. Time is not the constraint here: I may retry the whole two-stage review once, never just re-ask for a friendlier verdict.
++- **Sells are advisory.** Exits reduce exposure, so a Codex veto on a sell does not block it; it goes in the session report.
++- **Codex never decides alone.** It can only lower a size. It does not see account data, has no broker tools, and runs read-only.
++- The ledger records every verdict next to the order, so Codex's calls can be scored against outcomes later. It is the only way to measure the reviewer: the backtest cannot, because a model replaying history already knows what happened next.
++
+ ## Three-Pillar Framework (Standard Output Format)
+ 
+ Each pillar ranges from **-2 to +2**:
+@@ -196,4 +212,4 @@ See `scripts/indicators.py` and `scripts/score.py` for exact implementation deta
+ 
+ ## What This Skill Does NOT Do
+ 
+-It is not a signal service, and it is not a proven strategy: it is the user's framework executed with discipline. It runs on a schedule and executes on its own within the Mandate, but **the framework has no backtest** — a trigger firing does not make it correct. It does not average down. It does not touch protected positions. It does not trade options, crypto or margin. It does not generate HTML outside of Fridays.
++It is not a signal service, and it is not a proven strategy: it is the user's framework executed with discipline. It runs on a schedule and executes on its own within the Mandate. **The deterministic layer is backtested (`backtest/`), and the backtest does not show an edge**: over 2008–2026 on 30 liquid names, its entries did worse than random entries into the same names held for the same length of time (1st percentile), and its EXIT signals were followed by *above*-average returns. A trigger firing does not make it correct; size accordingly. Discretionary trades and the Codex review are not covered by the backtest. It does not average down. It does not touch protected positions. It does not trade options, crypto or margin. It does not generate HTML outside of Fridays.

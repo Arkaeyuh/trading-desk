@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# downloaded market data and run outputs: rebuild with the commands in backtest/README.md
+backtest/data/
+backtest/data_pit/
+backtest/universe_src/
+backtest/results/
+# local MCP registration (copy from .mcp.json.example)
+.mcp.json
