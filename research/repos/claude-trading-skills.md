@@ -44,3 +44,7 @@ Items 2–4 need daily **volume**, which our fetchers drop. Yahoo returns it; ad
 - **Chart-screenshot skills** (`technical-analyst`, `sector-analyst`, `breadth-chart-analyst`): an LLM reading a picture of a chart. That is exactly the "estimate numbers by eye" the engine exists to avoid.
 - **Narrative synthesizers** (`stanley-druckenmiller-investment`, `scenario-analyzer`, `market-news-analyst`, the `edge-*` pipeline): LLM-generated theses with no falsifiable output to test.
 - Options, futures, crypto, MT5, Japanese dividend/tax workflows, and the skill-maintenance meta tooling: out of scope.
+
+## Outcome of the volume tests (2026-10-28)
+
+Volume is now cached (`backtest/fetch_volume.py`). All three volume ideas were rejected in the 2008–2016 development period: the Stockbee momentum burst scored the 1st percentile vs random entries, the exhaustion hammer the 5th, and the IBD distribution-day gate on SPY the 2nd percentile vs randomly shifted cash periods (it sits in cash 76% of the time). Details are in `backtest/README.md`. The regime-gated RSI<30 idea (item 1) is still untested and needs a fresh hold-out.

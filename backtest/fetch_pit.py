@@ -132,7 +132,8 @@ def tiingo_fetch(sym: str, start: str, end: str, key: str) -> list[dict]:
             fac *= row.get("splitFactor") or 1.0
             continue
         out.append({"date": row["date"][:10], "open": o / fac, "high": h / fac, "low": l / fac,
-                    "close": c / fac, "adjclose": row["adjClose"]})
+                    "close": c / fac, "adjclose": row["adjClose"],
+                    "volume": row["volume"] * fac if row.get("volume") is not None else None})
         fac *= row.get("splitFactor") or 1.0
     out.reverse()
     return out

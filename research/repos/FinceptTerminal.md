@@ -21,3 +21,7 @@ Reviewed 2026-10-27 at `7716ee8` (v4.5.1). A Bloomberg-style **desktop terminal*
 - **Backtesting folder:** adapters around vectorbt / zipline / backtesting.py / bt. It has walk-forward splitters (vectorbt's), but nothing on survivorship, null models or multiple-testing corrections that our backtester lacks.
 - **Persona agents** ("Warren Buffett", "Benjamin Graham", "Peter Lynch"…): LLM role-play with no evaluation at all, which is weaker than TradingAgents.
 - **Most of the ~250 data connectors:** macro, government, climate, shipping, crypto, China A-shares, mostly thin request wrappers. When we need a source, it's quicker to write our own than to untangle AGPL code.
+
+## Outcome (2026-10-28)
+
+Both signals were tested and rejected in the 2008–2016 development period: IBS<0.2 scored the 3rd percentile vs random entries, and the −3σ down-move the 46th. IBS's next-day edge (+0.13% close-to-close) is about the size of trading costs. Details are in `backtest/README.md`.

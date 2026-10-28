@@ -6,7 +6,7 @@ Downloads daily OHLC bars for the backtest from Yahoo Finance's public chart
 endpoint and caches them as one JSON file per symbol:
 
   <out>/<SYM>.json  {"symbol", "source", "fetched_at",
-                     "bars": [{"date", "open", "high", "low", "close", "adjclose"}]}
+                     "bars": [{"date", "open", "high", "low", "close", "adjclose", "volume"}]}
 
 `close`/`open` are split-adjusted but NOT dividend-adjusted — the same basis as
 Robinhood's get_equity_historicals, so signals in the backtest are computed on
@@ -54,7 +54,8 @@ def fetch(sym: str, start: str, end: str) -> list[dict]:
         if None in (o, h, l, c) or adj[i] is None:
             continue  # Yahoo emits null rows on halts / partial sessions
         d = datetime.fromtimestamp(t, tz=timezone.utc).date().isoformat()
-        bars.append({"date": d, "open": o, "high": h, "low": l, "close": c, "adjclose": adj[i]})
+        bars.append({"date": d, "open": o, "high": h, "low": l, "close": c, "adjclose": adj[i],
+                     "volume": q["volume"][i]})  # split-adjusted share volume
     return bars
 
 

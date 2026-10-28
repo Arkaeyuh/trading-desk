@@ -11,7 +11,7 @@ No lookahead, by construction:
   - every decision on day t sees only bars up to and including t's close,
     in a trailing window of --window bars (default 290 = what the live desk
     fetches from get_equity_historicals, so EMA200 is seeded the same way);
-  - every fill happens at the OPEN of t+1, with --slippage-bps against us;
+  - every fill happens at the OPEN of t+1, with --slippage-bps against us (× VIX/--vix-ref with --vix-csv);
   - the macro pillar for day t uses ETF closes up to t (and, if supplied, the
     10Y-2Y spread up to t-1, since FRED publishes with a lag).
 
@@ -36,6 +36,7 @@ events.csv. stdlib only. Python 3.9+.
 """
 from __future__ import annotations
 import argparse
+import bisect
 import csv
 import json
 import math
@@ -57,6 +58,7 @@ EXIT_ACTIONS = ("EXIT / TRIM", "EXIT")
 HORIZONS = (5, 10, 20)
 
 RSI_MAX = 30  # --rsi-max; module-level so ENTRY_SIGNALS lambdas see it
+VIX: tuple[list[str], list[float]] | None = None  # --vix-csv: (sorted dates, closes)
 
 # Alternative entry signals (--entry), evaluated on the same indicator stack.
 # Thresholds are textbook values fixed before testing, not fitted.
@@ -66,6 +68,12 @@ ENTRY_SIGNALS = {
     "band_pullback": lambda r: (r["ema200"] is not None and r["close"] > r["ema200"]
                                 and r["percent_b"] is not None and r["percent_b"] < 0),
     "breakout": lambda r: r["high252"],
+    # From the FinceptTerminal review (Kakushadze & Serur, 151 Trading Strategies §4).
+    "ibs_low": lambda r: r["ibs"] is not None and r["ibs"] < 0.2,
+    "down_outlier": lambda r: r["ret_z"] is not None and r["ret_z"] < -3,
+    # Volume signals from the claude-trading-skills review (Stockbee screeners' defaults).
+    "burst": lambda r: r["burst"],
+    "hammer": lambda r: r["hammer"],
 }
 
 
@@ -90,6 +98,28 @@ def load_spread(path: str) -> dict[str, float]:
             except ValueError:
                 continue
     return out
+
+
+def load_vix(path: str) -> tuple[list[str], list[float]]:
+    """CBOE VIX_History.csv (DATE as MM/DD/YYYY, CLOSE) -> (ISO dates, closes)."""
+    rows = []
+    with open(path) as f:
+        for r in csv.DictReader(f):
+            m, d, y = r["DATE"].split("/")
+            rows.append((f"{y}-{m}-{d}", float(r["CLOSE"])))
+    rows.sort()
+    return [d for d, _ in rows], [c for _, c in rows]
+
+
+def slip_at(a, date: str) -> float:
+    """Slippage per side for a fill decided on `date`'s close. With --vix-csv it
+    scales with that close's VIX: --slippage-bps × VIX / --vix-ref."""
+    base = a.slippage_bps / 1e4
+    if VIX is None:
+        return base
+    dates, closes = VIX
+    j = bisect.bisect_right(dates, date) - 1
+    return base * closes[max(j, 0)] / a.vix_ref
 
 
 def macro_series(data_dir: str, window: int, spread: dict[str, float] | None,
@@ -123,12 +153,51 @@ def macro_series(data_dir: str, window: int, spread: dict[str, float] | None,
     return cal, pillar
 
 
+def _ret_z(close: list[float], i: int, n: int = 20) -> float | None:
+    if i < n + 1:
+        return None
+    rets = [close[j] / close[j - 1] - 1 for j in range(i - n, i)]
+    sd = pstdev(rets)
+    return (close[i] / close[i - 1] - 1) / sd if sd > 0 else None
+
+
+def _burst(bars: list[dict], i: int) -> bool:
+    """Stockbee momentum burst: close >= 4% above the prior close, on higher volume."""
+    b, p = bars[i], bars[i - 1]
+    return (i >= 1 and b["close"] >= 1.04 * p["close"]
+            and b.get("volume") is not None and p.get("volume") is not None and b["volume"] > p["volume"])
+
+
+def _hammer(bars: list[dict], i: int) -> bool:
+    """Stockbee exhaustion hammer: a pullback from a recent high, a low that undercuts
+    the prior 5-day low and closes back above it, a hammer candle, average+ volume."""
+    if i < 40:
+        return False
+    b = bars[i]
+    rng = b["high"] - b["low"]
+    if rng <= 0:
+        return False
+    if (min(b["open"], b["close"]) - b["low"] < 0.40 * rng or abs(b["close"] - b["open"]) > 0.35 * rng
+            or b["close"] - b["low"] < 0.60 * rng):
+        return False
+    hi = max(range(i - 40, i), key=lambda j: bars[j]["high"])
+    pull = b["close"] / bars[hi]["high"] - 1
+    if not (3 <= i - hi <= 30 and -0.35 <= pull <= -0.06):
+        return False
+    prior_low = min(x["low"] for x in bars[i - 5: i])
+    if not (b["low"] < prior_low < b["close"]):
+        return False
+    vols = [x.get("volume") for x in bars[i - 20: i]]
+    return b.get("volume") is not None and None not in vols and b["volume"] >= sum(vols) / 20
+
+
 def _signals_for(args: tuple) -> tuple[str, dict]:
     """Per-ticker precompute: decision both flat and holding, for every day."""
     data_dir, sym, window, min_bars, pillar, spells = args
     bars = load_bars(data_dir, sym)
     close = [b["close"] for b in bars]
     low = [b["low"] for b in bars]
+    high = [b["high"] for b in bars]
     rows = []
     for i in range(len(bars)):
         d = bars[i]["date"]
@@ -149,6 +218,11 @@ def _signals_for(args: tuple) -> tuple[str, dict]:
             "close": close[i], "ema20": ind["ema20"], "ema200": ind["ema200"],
             "rsi14": ind["rsi14"], "percent_b": ind["percent_b"],
             "high252": i >= 251 and close[i] >= max(close[i - 251: i + 1]),
+            # internal bar strength: where the close sits in the day's range
+            "ibs": (close[i] - low[i]) / (high[i] - low[i]) if high[i] > low[i] else None,
+            # today's close-to-close return in units of the prior 20 returns' stdev
+            "ret_z": _ret_z(close, i),
+            "burst": _burst(bars, i), "hammer": _hammer(bars, i), "low": low[i],
             # Point-in-time universe: may only be BOUGHT while an index member.
             "member": spells is None or any(lo <= d <= hi for lo, hi in spells),
         })
@@ -179,7 +253,6 @@ def _entry(sg: dict, entry: str) -> bool:
 
 
 def simulate(cal: list[str], tick: dict, a) -> dict:
-    slip = a.slippage_bps / 1e4
     # date -> bar index, per ticker
     idx = {s: {b["date"]: i for i, b in enumerate(v["bars"])} for s, v in tick.items()}
     start = next(i for i, d in enumerate(cal) if d >= a.start)
@@ -205,7 +278,7 @@ def simulate(cal: list[str], tick: dict, a) -> dict:
         for s, p in list(pos.items()):
             last = tick[s]["bars"][-1]
             if last["date"] <= d:
-                px = last["close"] * (1 - slip)
+                px = last["close"] * (1 - slip_at(a, last["date"]))
                 cash += p.shares * px
                 p.proceeds += p.shares * px
                 del pos[s]
@@ -233,7 +306,12 @@ def simulate(cal: list[str], tick: dict, a) -> dict:
                 for ea in EXIT_ACTIONS:
                     p.streak[ea] = p.streak[ea] + 1 if sg["hold"] == ea else 0
                 act = sg["hold"]
-                if a.exit_mode == "revert":
+                if a.exit_mode == "lowstop":
+                    if bar["close"] < p.stop:
+                        reason = "signal-day low"
+                    elif p.days >= a.revert_max_days:
+                        reason = "time stop"
+                elif a.exit_mode == "revert":
                     if sg["ema20"] is not None and bar["close"] >= sg["ema20"]:
                         reason = "revert target"
                     elif p.days >= a.revert_max_days:
@@ -263,8 +341,10 @@ def simulate(cal: list[str], tick: dict, a) -> dict:
                     if kind == "tactical" and a.skip_tactical_adverse:
                         continue
                     mult *= 0.5
-                buys.append((sg["total"], s, k, kind, mult, sg["pivot"]))
+                stop = sg["low"] if a.exit_mode == "lowstop" else sg["pivot"]
+                buys.append((sg["total"], s, k, kind, mult, stop))
 
+        slip = slip_at(a, d)
         for s, k, reason, frac in sells:
             p = pos[s]
             px = tick[s]["bars"][k]["open"] * (1 - slip)
@@ -300,7 +380,7 @@ def simulate(cal: list[str], tick: dict, a) -> dict:
     d = cal[end]
     for s, p in list(pos.items()):
         j = max(i for dd, i in idx[s].items() if dd <= d)
-        px = tick[s]["bars"][j]["close"] * (1 - slip)
+        px = tick[s]["bars"][j]["close"] * (1 - slip_at(a, d))
         cash += p.shares * px
         p.proceeds += p.shares * px
         trades.append({"symbol": s, "kind": p.kind, "entry_date": p.entry_date, "exit_date": d,
@@ -363,7 +443,6 @@ def random_baseline(tick: dict, trades: list[dict], a, sims: int) -> dict:
     """Null model: same tickers, same holding periods, random entry days.
     Answers 'do the entry signals beat entering at random?'"""
     rng = random.Random(a.seed)
-    slip = a.slippage_bps / 1e4
     windows = {}
     for s, v in tick.items():
         windows[s] = [i for i, b in enumerate(v["bars"]) if a.start <= b["date"] <= a.end
@@ -380,8 +459,12 @@ def random_baseline(tick: dict, trades: list[dict], a, sims: int) -> dict:
             i = w[rng.randrange(len(w))]
             # A random holding that runs past the end of the data is closed at the
             # last print, exactly as the strategy's would be (delisting).
-            out = bars[i + h]["open"] if i + h < len(bars) else bars[-1]["close"]
-            rs.append(out * (1 - slip) / (bars[i]["open"] * (1 + slip)) - 1)
+            # Costs are those of the random trade's own decision days (matters with --vix-csv).
+            if i + h < len(bars):
+                out = bars[i + h]["open"] * (1 - slip_at(a, bars[i + h - 1]["date"]))
+            else:
+                out = bars[-1]["close"] * (1 - slip_at(a, bars[-1]["date"]))
+            rs.append(out / (bars[i]["open"] * (1 + slip_at(a, bars[i - 1]["date"]))) - 1)
         means.append(mean(rs))
     means.sort()
     pct = sum(m < real for m in means) / len(means)
@@ -513,19 +596,23 @@ def main() -> int:
     ap.add_argument("--ignore-trim", action="store_true", help="Never sell on EXIT / TRIM.")
     ap.add_argument("--entry", default="framework", choices=("framework", "tactical", *ENTRY_SIGNALS),
                     help="Entry trigger when flat (framework = RE-ENTRY + TACTICAL REBOUND).")
-    ap.add_argument("--exit-mode", default="framework", choices=("framework", "revert"),
-                    help="revert: exit at close >= EMA20 or after --revert-max-days (mean-reversion trades).")
+    ap.add_argument("--exit-mode", default="framework", choices=("framework", "revert", "lowstop"),
+                    help="revert: exit at close >= EMA20 or after --revert-max-days (mean-reversion trades). "
+                         "lowstop: exit at a close below the signal day's low, or after --revert-max-days.")
     ap.add_argument("--revert-max-days", type=int, default=10)
     ap.add_argument("--rsi-max", type=float, default=30, help="Threshold for --entry oversold (RSI14 below it).")
     ap.add_argument("--tactical-max-days", type=int, default=10)
     ap.add_argument("--skip-tactical-adverse", action="store_true")
     ap.add_argument("--spread-csv", help="Optional 10Y-2Y CSV (date,value), e.g. FRED T10Y2Y.")
+    ap.add_argument("--vix-csv", help="CBOE VIX_History.csv: scale slippage by VIX / --vix-ref on each fill's decision day.")
+    ap.add_argument("--vix-ref", type=float, default=20, help="VIX at which slippage equals --slippage-bps.")
     ap.add_argument("--sims", type=int, default=500)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     a = ap.parse_args()
-    global RSI_MAX
+    global RSI_MAX, VIX
     RSI_MAX = a.rsi_max
+    VIX = load_vix(a.vix_csv) if a.vix_csv else None
 
     member = None
     if a.membership:
@@ -563,7 +650,7 @@ def main() -> int:
         "period": (sim["start"], sim["end"]), "n_symbols": len(syms), "symbols": syms,
         "config": vars(a),
         "config_line": (f"capital ${a.capital:,.0f} · base {a.base_pct:.0%} ≤ ${a.max_order:,.0f} · reserve "
-                        f"{a.cash_reserve:.0%} · slip {a.slippage_bps:g}bp · trim {a.trim_frac:g} · "
+                        f"{a.cash_reserve:.0%} · slip {a.slippage_bps:g}bp{f' × VIX/{a.vix_ref:g}' if VIX else ''} · trim {a.trim_frac:g} · "
                         f"stops {'off' if a.no_stops else 'on'} · window {a.window}"
                         f" · exit confirm {a.exit_confirm}{' <EMA50' if a.exit_below_ema50 else ''}"
                         f" · trim {'ignored' if a.ignore_trim else f'confirm {a.trim_confirm}'}"

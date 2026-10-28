@@ -184,6 +184,98 @@ Portfolio Sharpe ranged from 0.04 to 0.44 across the grid; SPY at the same expos
 
 **Verdict: no plateau.** The threshold we carried forward sits in a *valley*: worse than both neighbours, and below chance with a 5-day stop. Edge that jumps from the 13th to the 99th percentile when the threshold moves 5 RSI points is noise in the timing, not a stable effect. RSI<25 looks consistent across all three stops, but picking it now would be choosing the best cell after seeing the grid. It is a hypothesis for a fresh hold-out, not a result. No cell beats SPY at the same exposure on Sharpe.
 
+## Experiment: IBS and outlier down-moves (dev only, point-in-time, 2026-10-28)
+
+These two OHLC-only mean-reversion signals come from the FinceptTerminal review and were implemented from their original definitions. Rules and pass criterion were fixed before any run: textbook thresholds, 2008–2016 on the point-in-time universe, **≥95th percentile vs random entries with ≥100 trades** to earn one run on 2017–2026.
+
+- `--entry ibs_low`: IBS = (close − low) / (high − low) < 0.2, held one session (`--exit-mode revert --revert-max-days 1`: next open to the open after).
+- `--entry down_outlier`: close-to-close return below −3 standard deviations of the prior 20 daily returns, with the same exit as RSI<30 (`--exit-mode revert`: close ≥ EMA20, or 10 sessions).
+
+| Candidate | pct vs random | mean trade (random 5–95%) | Sharpe | CAGR | maxDD | exposure | SPY at same exposure | n |
+|---|---|---|---|---|---|---|---|---|
+| E6 IBS < 0.2, 1 day | **3** | −0.10% (−0.09..+0.02%) | −0.85 | −1.66% | −14.5% | 7% | +0.63%, Sharpe 0.43 | 6,617 |
+| E7 return < −3σ | **46** | +0.16% (+0.00..+0.37%) | 0.10 | +0.45% | −14.1% | 26% | +2.23%, Sharpe 0.43 | 3,559 |
+
+**Verdict: both rejected in development; the hold-out was not run.**
+- **The outlier down-move carries no timing information:** 46th percentile, which is what random entries would score. Its 10-day excess return in the event study is −0.01% (n=10,101).
+- **IBS has a real effect, but it is too small to trade.** Across every member-day in 2008–2016, the next day's close-to-close return after IBS < 0.2 beats the average day by **+0.13%**: +0.06% overnight and +0.07% the next session. That is about the size of a 10 bp round trip. The desk fills at the next open, so it misses the overnight half. Even filling at the signal day's close would leave ≈ +0.03% after costs. In the backtest the trades did worse than random (3rd percentile). One likely reason is that roughly 90 names qualify on a typical day and the top 3 are picked by the framework's pillar total, which earlier tests found to be anti-informative.
+- Mean reversion remains the only family with any edge here, and so far only RSI<30 has been strong enough to survive costs.
+
+## Cost model: VIX-scaled slippage, RSI14<30 (point-in-time, 2026-10-28)
+
+The flat-cost sweep assumed the same slippage every day, but RSI<30 is a dip-buying signal, and spreads widen in a selloff. This test scales costs with market stress. The model was fixed before any run: **cost per side = `--slippage-bps` × VIX / 20**, using VIX at the close of the decision day (known before the next-open fill). 20 is about the 2008–2026 mean (19.8), so an average day costs the same as the flat model and a VIX-80 day costs 4×. The random baseline pays the costs of its own decision days, so the percentile vs random can now move.
+
+```bash
+curl -sL -o backtest/data/VIX_History.csv https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv   # CBOE, free, no key
+python3 backtest/backtest.py --data backtest/data_pit --membership backtest/data_pit/membership.json \
+    --entry oversold --exit-mode revert --vix-csv backtest/data/VIX_History.csv --slippage-bps 5
+```
+
+Without `--vix-csv` the trades are identical to the earlier runs (regression-checked).
+
+| base | period | cost model | pct vs random | mean trade (random) | Sharpe | CAGR | maxDD |
+|---|---|---|---|---|---|---|---|
+| 5 bp | 2008–2016 | flat | 80 | +0.31% (+0.20%) | 0.22 | +1.92% | −28.7% |
+| 5 bp | 2008–2016 | × VIX/20 | 79 | +0.30% (+0.20%) | 0.22 | +1.88% | −28.9% |
+| 10 bp | 2008–2016 | flat | — | +0.21% | 0.15 | +1.05% | — |
+| 10 bp | 2008–2016 | × VIX/20 | 78 | +0.19% (+0.09%) | 0.14 | +0.98% | −29.6% |
+| 5 bp | 2017–2026 | flat | 99 | +0.40% (+0.15%) | 0.39 | +3.67% | −17.1% |
+| 5 bp | 2017–2026 | × VIX/20 | 99 | +0.41% (+0.16%) | 0.40 | +3.78% | −17.1% |
+| 10 bp | 2017–2026 | flat | — | +0.30% | 0.27 | +2.39% | −18.1% |
+| 10 bp | 2017–2026 | × VIX/20 | 99 | +0.32% (+0.07%) | 0.29 | +2.61% | −18.0% |
+
+SPY held at the same exposure: +2.60% CAGR, Sharpe 0.43 (2008–2016); +6.79%, Sharpe 0.87 (2017–2026).
+
+**Verdict: market-wide stress costs do not hurt RSI<30, because its trades are not concentrated in stressed markets.**
+- Entry-day VIX averaged 1.10× the reference in 2008–2016 (all days: 1.05×) and 0.93× in 2017–2026 (all days: 0.94×). Only 14% and 6% of entries came on days with VIX above 30.
+- **Why:** in a broad selloff hundreds of names go oversold at once, but the book takes at most 3 new positions a day and runs into its cash reserve within days. Most of its trades are therefore stock-specific dips on ordinary days.
+- **The edge versus random entries is unchanged** (79th/99th percentile), and the gap to SPY at the same exposure is unchanged too. The earlier conclusion stands: a research lead, not a live signal.
+- **What VIX cannot see:** a single stock gapping down on its own news, on a calm day, with its spread widened. That is the typical RSI<30 entry here. Measuring it needs a per-stock, per-day spread estimate from daily high/low (Corwin & Schultz 2012), not a market index.
+
+## Experiment: volume signals (dev only, point-in-time, 2026-10-28)
+
+These three signals come from the claude-trading-skills review. Their rules are the skills' defaults turned into hard rules, and those rules and the pass criteria were fixed before any run. They need daily volume, which the fetchers used to drop. `fetch_volume.py` re-fetches each cached file from its own source and merges volume in by date without changing any price, so every earlier result still reproduces:
+
+```bash
+python3 backtest/fetch_volume.py --only yahoo     # ~5 min
+python3 backtest/fetch_volume.py --only tiingo    # ~2.5 h: 120 files at Tiingo's 50 requests/hour
+```
+
+Every file got volume. One exception needed a manual step: CPWR's Tiingo prices now differ from the cached ones by a constant ×2.17, a revised split adjustment. The script refuses any file whose prices differ, so CPWR's volume was merged by hand. The signals only compare volume with nearby days, so the scale does not matter.
+
+**Stock signals.** Pass rule: ≥95th percentile vs random entries, with ≥100 trades.
+- `--entry burst` (Stockbee momentum burst): close ≥ 1.04 × the prior close, on higher volume than the prior day. Exit on a close below the trigger day's low, or after 5 sessions (`--exit-mode lowstop --revert-max-days 5`).
+- `--entry hammer` (Stockbee exhaustion hammer):
+  - the highest high of the prior 40 bars came 3–30 sessions ago, and the close is 6–35% below it;
+  - the low undercuts the prior 5-day low and the close is back above it;
+  - lower wick ≥ 40% of the day's range, body ≤ 35%, close in the top 40%;
+  - volume ≥ the 20-day average.
+  Exit on a close below the hammer day's low, or after 10 sessions.
+
+| Candidate | pct vs random | mean trade (random 5–95%) | Sharpe | CAGR | maxDD | exposure | SPY at same exposure | n |
+|---|---|---|---|---|---|---|---|---|
+| E8 momentum burst | **1** | −0.12% (−0.02..+0.28%) | −0.13 | −1.13% | −20.2% | 23% | +1.99%, Sharpe 0.43 | 4,955 |
+| E9 exhaustion hammer | **5** | −0.02% (−0.01..+0.40%) | 0.08 | +0.27% | −13.8% | 16% | +1.42%, Sharpe 0.43 | 2,270 |
+
+**Market gate.** `distribution_gate.py` applies IBD distribution days to SPY:
+- a distribution day is a close down ≥ 0.2% on higher volume than the prior day;
+- it stays active for 25 sessions, unless a later high reaches 5% above its close;
+- the gate goes to cash when the skill's risk level is HIGH or worse (d25 ≥ 5, d15 ≥ 3 or d5 ≥ 2).
+
+The null model shifts the same in/out mask to random offsets, which keeps how often and how long the gate is out and moves only when. Pass rule: Sharpe ≥ the 95th percentile of the shifted masks.
+
+| 2008–2016 | CAGR | Sharpe | maxDD | in market |
+|---|---|---|---|---|
+| gate | −3.90% | −0.38 | −34.6% | 24% |
+| SPY buy & hold | +7.28% | 0.44 | −52.0% | 100% |
+| SPY at same exposure | +2.09% | 0.44 | −14.5% | 24% |
+| shifted masks (null) | median Sharpe 0.18, 5–95% −0.26..0.66 | | | |
+
+**Verdict: all three rejected in development; the hold-out was not run.**
+- **The momentum burst is worse than random entries** (1st percentile). It joins every other momentum-continuation entry tested here (breakouts, the framework's `RE-ENTRY`), all of which lost to random timing. On these names, daily momentum does not continue; it reverts.
+- **The exhaustion hammer is also worse than random** (5th percentile), even though it is a mean-reversion signal. In the event study its 10-day excess return is −0.39% (n=4,642). The day-low stop exits more than half the trades, 54%, often on the next session's noise. Its rules require a stock that is still pulling back from a recent high, and that may select names in steady decline rather than exhausted ones.
+- **The distribution-day gate times the market worse than chance** (2nd percentile). Under the skill's rules, 23.5% of SPY sessions count as distribution days, so a typical 25-session window holds about 6 and the gate sits in cash 76% of the time. SPY's next 20 sessions averaged +0.69% after risk-off days against +0.87% after risk-on days, which is almost no difference.
+
 ## Suggested next experiments
 
 These are hypotheses. Each one should go through a held-out period, not be fitted on the full sample:
