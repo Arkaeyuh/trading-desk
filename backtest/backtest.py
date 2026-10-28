@@ -56,11 +56,13 @@ ENTRY_ACTIONS = ("RE-ENTRY (new cycle)", "TACTICAL REBOUND (counter-trend)")
 EXIT_ACTIONS = ("EXIT / TRIM", "EXIT")
 HORIZONS = (5, 10, 20)
 
+RSI_MAX = 30  # --rsi-max; module-level so ENTRY_SIGNALS lambdas see it
+
 # Alternative entry signals (--entry), evaluated on the same indicator stack.
 # Thresholds are textbook values fixed before testing, not fitted.
 ENTRY_SIGNALS = {
     "trend_pullback": lambda r: r["ema200"] is not None and r["close"] > r["ema200"] and r["rsi14"] < 35,
-    "oversold": lambda r: r["rsi14"] is not None and r["rsi14"] < 30,
+    "oversold": lambda r: r["rsi14"] is not None and r["rsi14"] < RSI_MAX,
     "band_pullback": lambda r: (r["ema200"] is not None and r["close"] > r["ema200"]
                                 and r["percent_b"] is not None and r["percent_b"] < 0),
     "breakout": lambda r: r["high252"],
@@ -514,6 +516,7 @@ def main() -> int:
     ap.add_argument("--exit-mode", default="framework", choices=("framework", "revert"),
                     help="revert: exit at close >= EMA20 or after --revert-max-days (mean-reversion trades).")
     ap.add_argument("--revert-max-days", type=int, default=10)
+    ap.add_argument("--rsi-max", type=float, default=30, help="Threshold for --entry oversold (RSI14 below it).")
     ap.add_argument("--tactical-max-days", type=int, default=10)
     ap.add_argument("--skip-tactical-adverse", action="store_true")
     ap.add_argument("--spread-csv", help="Optional 10Y-2Y CSV (date,value), e.g. FRED T10Y2Y.")
@@ -521,6 +524,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     a = ap.parse_args()
+    global RSI_MAX
+    RSI_MAX = a.rsi_max
 
     member = None
     if a.membership:

@@ -168,6 +168,22 @@ Costs are charged per side at entry and exit (`--slippage-bps`). The random base
 
 **Break-even is about 20 bp per side** (≈ 0.4% round trip), at roughly 460 trades a year. For $375–$1,200 market orders in S&P 500 names at the open, normal costs are a few bp, so 5–10 bp is a realistic range. It can be well above that in a selloff, which is exactly when RSI<30 fires; per-day spread estimates (Corwin-Schultz) would measure that. Even at 5 bp, the strategy trails SPY held at the same exposure in both periods.
 
+## Parameter plateau: RSI threshold × time stop (dev 2008–2016 only, point-in-time, 2026-10-27)
+
+This is the "plateaus, not peaks" check, adopted from claude-trading-skills' `backtest-expert`. It was run on the development period only, so the hold-out is not spent again. `--rsi-max` sets the threshold, `--revert-max-days` the time stop.
+
+Percentile vs random entries (mean trade vs random in brackets):
+
+| RSI14 below | 5-day stop | 10-day stop | 15-day stop |
+|---|---|---|---|
+| 25 | 99 (+0.34% vs +0.04%) | 99 (+0.61% vs +0.14%) | 99 (+0.85% vs +0.25%) |
+| **30** (tested so far) | **13** (−0.04% vs +0.07%) | 80 (+0.31% vs +0.20%) | 61 (+0.33% vs +0.29%) |
+| 35 | 95 (+0.20% vs +0.07%) | 95 (+0.36% vs +0.20%) | 88 (+0.41% vs +0.28%) |
+
+Portfolio Sharpe ranged from 0.04 to 0.44 across the grid; SPY at the same exposure scored 0.43 over this period.
+
+**Verdict: no plateau.** The threshold we carried forward sits in a *valley*: worse than both neighbours, and below chance with a 5-day stop. Edge that jumps from the 13th to the 99th percentile when the threshold moves 5 RSI points is noise in the timing, not a stable effect. RSI<25 looks consistent across all three stops, but picking it now would be choosing the best cell after seeing the grid. It is a hypothesis for a fresh hold-out, not a result. No cell beats SPY at the same exposure on Sharpe.
+
 ## Suggested next experiments
 
 These are hypotheses. Each one should go through a held-out period, not be fitted on the full sample:

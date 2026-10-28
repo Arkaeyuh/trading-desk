@@ -10,6 +10,7 @@ Rule: **a signal has to beat random entries into the same names, out of sample, 
 |---|---|
 | `engine/` | Deterministic indicator stack, three-pillar scorer and macro pillar (stdlib). Vendored from agentic-trading-desk, see `third_party/`. |
 | `backtest/` | Walk-forward backtester with random-entry null model, event study, entry/exit variants, slippage; data fetchers for Yahoo and a point-in-time S&P 500 universe (Tiingo for delisted names). Method, all results and caveats: [`backtest/README.md`](backtest/README.md). |
+| `analysis/residual_edge.py` | Residual-edge attribution: OLS alpha vs predeclared baselines with HAC t-stats, rolling stability and regime breakdown (vendored from claude-trading-skills). Run on any backtest with `python3 backtest/attribution.py <run dir>`. |
 | `review/codex_review.py` | Second-opinion gate: blind-then-reveal review of a proposed buy by an independent Codex session over MCP; fixed skip / halve / proceed policy, fail closed. |
 | `research/repos/` | One note per reviewed repository: what we kept, what we tested, what we rejected. |
 | `.mcp.json.example` | Project-scoped Codex MCP registration (`cp .mcp.json.example .mcp.json`, or `claude mcp add codex -- codex mcp-server`). |
