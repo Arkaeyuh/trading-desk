@@ -276,6 +276,91 @@ The null model shifts the same in/out mask to random offsets, which keeps how of
 - **The exhaustion hammer is also worse than random** (5th percentile), even though it is a mean-reversion signal. In the event study its 10-day excess return is −0.39% (n=4,642). The day-low stop exits more than half the trades, 54%, often on the next session's noise. Its rules require a stock that is still pulling back from a recent high, and that may select names in steady decline rather than exhausted ones.
 - **The distribution-day gate times the market worse than chance** (2nd percentile). Under the skill's rules, 23.5% of SPY sessions count as distribution days, so a typical 25-session window holds about 6 and the gate sits in cash 76% of the time. SPY's next 20 sessions averaged +0.69% after risk-off days against +0.87% after risk-on days, which is almost no difference.
 
+## Fresh hold-out: S&P 400 mid-caps (pre-registered 2026-10-28, before any data was fetched)
+
+Every hypothesis still open came out of the S&P 500 data, and both of its periods have now been looked at many times. This hold-out keeps the same rules and changes the **names** instead of the years. The new universe is the S&P MidCap 400, which no experiment has touched.
+
+**Universe.** Point-in-time membership is rebuilt from the revision history of Wikipedia's "List of S&P 400 companies" (`sp400_membership.py`):
+- one snapshot per quarter, March 2011 → September 2026: 60 snapshots, 1,088 tickers;
+- a spell runs from the revision date of the first snapshot that lists a name to the revision date of the first one that drops it, so the universe never knows about a change before it was visible;
+- spells are cut wherever the ticker was in the S&P 500 at the same time, so no (ticker, day) pair overlaps the earlier experiments.
+
+It is an approximation: editors lag the real index changes, and a name that joined and left between two snapshots is missed. Prices come from `fetch_pit.py` into `backtest/data_mid/` (Yahoo, then Tiingo for delisted names).
+
+```bash
+python3 backtest/sp400_membership.py
+python3 backtest/fetch_pit.py --membership-csv backtest/universe_src/sp400_ticker_start_end.csv --out backtest/data_mid --since 2011-01-01
+python3 backtest/fetch_data.py MDY --out backtest/data_mid      # mid-cap benchmark
+```
+
+**Tests**, each run **once**, over 2011-06-01 → 2026-10 with `--exit-mode revert` (close ≥ EMA20, or 10 sessions) and all other settings at their defaults:
+
+| | hypothesis | flags | where it came from |
+|---|---|---|---|
+| H0 | RSI14<30 beats random entries on unseen names | `--entry oversold` | the 2017–2026 S&P 500 result |
+| H1 | the RSI<25 threshold is the more stable one | `--entry oversold --rsi-max 25` | the plateau grid (2008–2016) |
+| H2 | dip-buying only pays while SPY is in a downtrend | `--entry oversold --spy-below-sma200` | the regime split in the claude-trading-skills analysis |
+| H3 | capping concurrent positions cuts the drawdown | `--entry oversold --max-positions 10` | the selloff concentration seen in 2020/2022 |
+
+**Pass rules**, fixed now:
+- H0–H2 pass if they reach the **≥ 99th percentile vs random entries** (one-sided p ≤ 0.01: a Bonferroni-style correction for four tests at 5%), with ≥ 100 trades.
+- H3 is about risk, not timing. It passes if its max drawdown is at least a third smaller than H0's, with the percentile vs random no more than 5 points lower.
+- Any test that passes then gets the slippage sweep (5/10/25 bp, and VIX-scaled).
+- Every result is reported next to SPY and MDY held at the same exposure.
+
+## Insider purchases, SEC Form 4 (pre-registered 2026-10-31, before any insider data was fetched)
+
+This idea came from a promo video about copying "insider and congressional trades" with an agent (`research/videos/ai-trading-agent-video-summary.md`). Congressional trades are not tested: disclosure takes up to 45 days, and the evidence after 2012 is weak. Form 4 is due within two business days, and insider *purchases* have a published anomaly (Jeng, Metrick & Zeckhauser 2003; Cohen, Malloy & Pomorski 2012).
+
+**Data.** `fetch_insider.py` downloads the SEC's quarterly Insider Transactions Data Sets (2006 Q1 →) and keeps open-market purchases (transaction code P). The SEC requires a contact User-Agent:
+
+```bash
+echo "Your Name you@example.com" > ~/.config/sec/user_agent
+python3 backtest/fetch_insider.py --fetch          # ~83 quarters, resumable, into backtest/data_insider/
+```
+
+**Point in time.** Forms 3/4/5 filed by 10 pm ET get that day's filing date, so a filing can land after the close. The decision is made at the close of the first session on or after the filing date, and the fill is at the next open. Filings are matched to the universe by ticker, its rename, or the issuer CIK, and only inside a membership spell.
+
+**Signals**, fixed now:
+- A *qualifying filing* is an original Form 4 (4/A dropped) with an officer or director among the reporting owners and **≥ $10,000** of code-P purchases at a positive price. Filings by 10% owners only (mostly funds) are dropped.
+- `insider_buy`: a qualifying filing arrived today.
+- `insider_cluster`: a qualifying filing arrived today, and **≥ 3 distinct insiders** filed qualifying purchases in the last 30 calendar days.
+- Same-day candidates above `--max-new` are ranked by $ bought in that 30-day window, not by the pillar total (found anti-informative earlier).
+- Exit: hold **63 sessions** (`--exit-mode time --hold-days 63`), about 3 months, the literature's horizon. No stops. Everything else is at its default (5 bp, 3% ≤ $1,200, max 3 new per day).
+
+**Protocol:**
+1. **Dev:** S&P 500 point-in-time, 2008–2016, both signals. A signal passes at **≥ 95th percentile vs random entries with ≥ 100 trades**. The winner is the passing signal with the higher percentile (ties broken by Sharpe). If neither passes, stop here.
+2. **Hold-out, winner only, each run once:** S&P 500 2017–2026, and S&P 400 2011-06-01 → 2026-10 (`backtest/data_mid`, the names never tuned on). It passes at **≥ 95th percentile on both**.
+3. **Worth trading** only if it also beats SPY (and MDY on mid-caps) held at the same exposure on Sharpe, shows positive alpha in `attribution.py`, and survives the slippage sweep (5/10/25 bp). The 25 bp case matters most on mid-caps. Its entries must also not simply be RSI<30 days: report how many entries had RSI14 < 30.
+4. Forward paper trading only after step 3, as a fresh hold-out with a settled ledger.
+
+```bash
+for e in buy cluster; do
+  python3 backtest/backtest.py --data backtest/data_pit --membership backtest/data_pit/membership.json \
+    --insider backtest/data_insider --exit-mode time --hold-days 63 \
+    --entry insider_$e --start 2008-01-01 --end 2016-12-31 --out backtest/results/insider/dev_$e
+done
+```
+
+### Results (2026-10-31)
+
+Data: 2006 Q1 → 2026 Q1 (the SEC had not published later quarters), 194,490 qualifying filings, 10,275 of them matched to S&P 500 members on the filing date. Most of the rest are small caps outside the universe.
+
+A mapping bug was found and fixed **before** the hold-out run. `fetch_pit`'s renames merge old and new tickers into one data file (GEN holds SYMC 2003→, NLOK, GEN), so a reused ticker could attach another company's filings to it (GenOn traded as "GEN" in 2011). Filings are now checked against the spells of the ticker as it was at the time (`--membership-csv`). The fix moved about 300 filings; dev was re-run with nothing else changed.
+
+| run | trades | mean / trade | random entries | percentile | SPY on the same dates | CAGR | SPY @ same exposure |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| dev `insider_buy` 2008–16 | 1,399 | +3.27% | +2.27% | 98 | +2.23% | 7.81% (Sharpe 0.44, maxDD −52%) | 6.01% (0.43) |
+| dev `insider_cluster` 2008–16 | 268 | +4.54% | +1.31% | **99 → winner** | +1.50% | 1.66% (0.19) | 1.41% (0.43) |
+| **hold-out `insider_cluster` S&P 500 2017–26** | 237 | +4.75% | +1.54% | **100** | **+5.97%** | 1.85% (0.37) | 2.32% (0.87) |
+
+- **Step 2 passes on the S&P 500:** 100th percentile vs random entries. The S&P 400 half is pending, because `data_mid` is missing 329 delisted names and has no `membership.json` yet.
+- **Step 3 fails.** The book trails SPY at the same exposure (1.85% vs 2.32% CAGR, Sharpe 0.37 vs 0.87). `attribution.py` gives an annualized alpha of −0.94% (HAC t −0.79), status RESIDUAL_FRAGILE, NOT_AUTHORIZED.
+- **Why both hold:** clusters fire when the whole market is down. Insiders across many companies buy in the same selloff (2020: +15% per trade over random entries in the same name and year; 2009 in dev: +38%). The random-entry null spreads its entries over all dates, so it credits that market timing as stock skill. Against SPY over the **same dates**, the hold-out trades return −1.22% on average (median −1.67%), and 46% beat SPY. Trade returns exclude dividends while SPY's include them, worth roughly 0.5% per 63 days, which does not close the gap. In dev the same-date excess was +3.0% for clusters (mean only; median −0.74%, driven by 2009) and +1.0% for single buys (median +0.18%).
+- 66 of 237 hold-out entries (28%) were also RSI14<30 days.
+- **Verdict: rejected on the S&P 500.** On these names, the insider signal is a lagging indicator of market selloffs, not stock-specific information. For any future event signal, the null should include the market over the same dates, not only random dates.
+- **Still open:** the S&P 400 hold-out, run once when `data_mid` is complete, with the same step-3 rules (MDY at the same exposure, plus a same-dates comparison against MDY). The literature puts the effect in smaller stocks, so this is the one test left that could change the verdict.
+
 ## Suggested next experiments
 
 These are hypotheses. Each one should go through a held-out period, not be fitted on the full sample:

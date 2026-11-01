@@ -51,6 +51,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "engine"))
 import indicators as I  # noqa: E402
 import macro_pillar as M  # noqa: E402
 import score as S  # noqa: E402
+sys.path.insert(0, HERE)
+import fetch_insider as FI  # noqa: E402
 
 MACRO_ETFS = ["SPY", "RSP", "IWM", "HYG", "LQD", "TLT", "XLY", "XLP"]
 ENTRY_ACTIONS = ("RE-ENTRY (new cycle)", "TACTICAL REBOUND (counter-trend)")
@@ -59,6 +61,7 @@ HORIZONS = (5, 10, 20)
 
 RSI_MAX = 30  # --rsi-max; module-level so ENTRY_SIGNALS lambdas see it
 VIX: tuple[list[str], list[float]] | None = None  # --vix-csv: (sorted dates, closes)
+SPY_DOWNTREND: set[str] = set()  # dates SPY closed below its 200-day SMA (--spy-below-sma200)
 
 # Alternative entry signals (--entry), evaluated on the same indicator stack.
 # Thresholds are textbook values fixed before testing, not fitted.
@@ -74,6 +77,9 @@ ENTRY_SIGNALS = {
     # Volume signals from the claude-trading-skills review (Stockbee screeners' defaults).
     "burst": lambda r: r["burst"],
     "hammer": lambda r: r["hammer"],
+    # SEC Form 4 open-market purchases (video review; fetch_insider.py). Need --insider.
+    "insider_buy": lambda r: r["ins_buy"],
+    "insider_cluster": lambda r: r["ins_cluster"],
 }
 
 
@@ -193,8 +199,9 @@ def _hammer(bars: list[dict], i: int) -> bool:
 
 def _signals_for(args: tuple) -> tuple[str, dict]:
     """Per-ticker precompute: decision both flat and holding, for every day."""
-    data_dir, sym, window, min_bars, pillar, spells = args
+    data_dir, sym, window, min_bars, pillar, spells, ins = args
     bars = load_bars(data_dir, sym)
+    flags = FI.insider_flags([b["date"] for b in bars], ins or [])
     close = [b["close"] for b in bars]
     low = [b["low"] for b in bars]
     high = [b["high"] for b in bars]
@@ -223,6 +230,7 @@ def _signals_for(args: tuple) -> tuple[str, dict]:
             # today's close-to-close return in units of the prior 20 returns' stdev
             "ret_z": _ret_z(close, i),
             "burst": _burst(bars, i), "hammer": _hammer(bars, i), "low": low[i],
+            "ins_buy": flags[i][0], "ins_cluster": flags[i][1], "ins_value": flags[i][2],
             # Point-in-time universe: may only be BOUGHT while an index member.
             "member": spells is None or any(lo <= d <= hi for lo, hi in spells),
         })
@@ -311,6 +319,9 @@ def simulate(cal: list[str], tick: dict, a) -> dict:
                         reason = "signal-day low"
                     elif p.days >= a.revert_max_days:
                         reason = "time stop"
+                elif a.exit_mode == "time":
+                    if p.days >= a.hold_days:
+                        reason = "hold period"
                 elif a.exit_mode == "revert":
                     if sg["ema20"] is not None and bar["close"] >= sg["ema20"]:
                         reason = "revert target"
@@ -331,7 +342,8 @@ def simulate(cal: list[str], tick: dict, a) -> dict:
                 if reason:
                     frac = a.trim_frac if reason == "EXIT / TRIM" else 1.0
                     sells.append((s, k, reason, frac))
-            elif not breaker and sg["member"] and _entry(sg, a.entry):
+            elif (not breaker and sg["member"] and _entry(sg, a.entry)
+                  and (not a.spy_below_sma200 or d in SPY_DOWNTREND)):
                 if a.entry in ENTRY_SIGNALS:
                     kind, mult = a.entry, 1.0
                 else:
@@ -342,7 +354,10 @@ def simulate(cal: list[str], tick: dict, a) -> dict:
                         continue
                     mult *= 0.5
                 stop = sg["low"] if a.exit_mode == "lowstop" else sg["pivot"]
-                buys.append((sg["total"], s, k, kind, mult, stop))
+                # Same-day candidates beyond --max-new are ranked by pillar total, or for
+                # insider entries by $ bought in the cluster window (pre-registered).
+                rank = sg["ins_value"] if a.entry.startswith("insider") else sg["total"]
+                buys.append((rank, s, k, kind, mult, stop))
 
         slip = slip_at(a, d)
         for s, k, reason, frac in sells:
@@ -369,6 +384,8 @@ def simulate(cal: list[str], tick: dict, a) -> dict:
             eq_open += p.shares * (tick[p.sym]["bars"][k]["open"] if k is not None else last_px[p.sym])
         buys.sort(key=lambda b: (-b[0], b[1]))
         for total, s, k, kind, mult, pivot in buys[: a.max_new]:
+            if a.max_positions and len(pos) >= a.max_positions:
+                break
             size = min(a.base_pct * eq_open, a.max_order) * mult
             if cash - size < a.cash_reserve * eq_open or size < 1:
                 continue
@@ -596,9 +613,14 @@ def main() -> int:
     ap.add_argument("--ignore-trim", action="store_true", help="Never sell on EXIT / TRIM.")
     ap.add_argument("--entry", default="framework", choices=("framework", "tactical", *ENTRY_SIGNALS),
                     help="Entry trigger when flat (framework = RE-ENTRY + TACTICAL REBOUND).")
-    ap.add_argument("--exit-mode", default="framework", choices=("framework", "revert", "lowstop"),
+    ap.add_argument("--exit-mode", default="framework", choices=("framework", "revert", "lowstop", "time"),
                     help="revert: exit at close >= EMA20 or after --revert-max-days (mean-reversion trades). "
-                         "lowstop: exit at a close below the signal day's low, or after --revert-max-days.")
+                         "lowstop: exit at a close below the signal day's low, or after --revert-max-days. "
+                         "time: exit after --hold-days sessions, nothing else.")
+    ap.add_argument("--hold-days", type=int, default=63, help="Holding period for --exit-mode time.")
+    ap.add_argument("--insider", help="Directory of fetch_insider.py quarter files (for --entry insider_*).")
+    ap.add_argument("--membership-csv", default=os.path.join(HERE, "universe_src", "sp500_ticker_start_end.csv"),
+                    help="Source CSV of --membership (index spells under the tickers of the time), for --insider.")
     ap.add_argument("--revert-max-days", type=int, default=10)
     ap.add_argument("--rsi-max", type=float, default=30, help="Threshold for --entry oversold (RSI14 below it).")
     ap.add_argument("--tactical-max-days", type=int, default=10)
@@ -606,13 +628,19 @@ def main() -> int:
     ap.add_argument("--spread-csv", help="Optional 10Y-2Y CSV (date,value), e.g. FRED T10Y2Y.")
     ap.add_argument("--vix-csv", help="CBOE VIX_History.csv: scale slippage by VIX / --vix-ref on each fill's decision day.")
     ap.add_argument("--vix-ref", type=float, default=20, help="VIX at which slippage equals --slippage-bps.")
+    ap.add_argument("--spy-below-sma200", action="store_true",
+                    help="New entries only on days SPY closed below its 200-day SMA.")
+    ap.add_argument("--max-positions", type=int, default=0, help="Cap on concurrent positions (0 = none).")
     ap.add_argument("--sims", type=int, default=500)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     a = ap.parse_args()
-    global RSI_MAX, VIX
+    global RSI_MAX, VIX, SPY_DOWNTREND
     RSI_MAX = a.rsi_max
     VIX = load_vix(a.vix_csv) if a.vix_csv else None
+    spy = load_bars(a.data, "SPY")
+    SPY_DOWNTREND = {spy[i]["date"] for i in range(199, len(spy))
+                     if spy[i]["close"] < mean(b["close"] for b in spy[i - 199: i + 1])}
 
     member = None
     if a.membership:
@@ -621,13 +649,26 @@ def main() -> int:
     cached = {f[:-5] for f in os.listdir(a.data) if f.endswith(".json")} - {"membership", "coverage"}
     syms = a.symbols or sorted((set(member) & cached) if member is not None else cached - set(MACRO_ETFS))
     spread = load_spread(a.spread_csv) if a.spread_csv else None
+    ins, ins_stats = {}, None
+    if a.entry.startswith("insider") and not a.insider:
+        ap.error("--entry insider_* needs --insider DIR")
+    if a.insider:
+        if member is None:
+            ap.error("--insider needs --membership (filings are matched to tickers through the spells)")
+        from fetch_pit import RENAMES, load_spells
+        names = {t: [sp[:2] for sp in v] for t, v in load_spells(a.membership_csv, "1900-01-01", "9999-12-31").items()}
+        ins, ins_stats = FI.load_events(a.insider, member, RENAMES, names)
+        top = sorted(ins_stats["unmapped_tickers"].items(), key=lambda kv: -kv[1])[:10]
+        print(f"insider: {ins_stats['mapped']}/{ins_stats['filings']} qualifying filings matched to the universe "
+              f"(others are mostly non-members; most frequent: {top})", file=sys.stderr)
     print(f"macro pillar over SPY calendar (window {a.window}{', with 10Y-2Y' if spread else ', no 10Y-2Y'})…",
           file=sys.stderr)
     cal, pillar = macro_series(a.data, a.window, spread)
     print(f"scoring {len(syms)} symbols × 2 states on {a.workers} workers…", file=sys.stderr)
     with ProcessPoolExecutor(max_workers=a.workers) as ex:
         tick = dict(ex.map(_signals_for, [(a.data, s, a.window, a.min_bars, pillar,
-                                           member.get(s) if member is not None else None) for s in syms]))
+                                           member.get(s) if member is not None else None,
+                                           ins.get(s)) for s in syms]))
 
     sim = simulate(cal, tick, a)
     trades = sim["trades"]
@@ -654,11 +695,15 @@ def main() -> int:
                         f"stops {'off' if a.no_stops else 'on'} · window {a.window}"
                         f" · exit confirm {a.exit_confirm}{' <EMA50' if a.exit_below_ema50 else ''}"
                         f" · trim {'ignored' if a.ignore_trim else f'confirm {a.trim_confirm}'}"
-                        f" · entry {a.entry} · exits {a.exit_mode}"),
+                        f" · entry {a.entry} · exits {a.exit_mode}"
+                        f"{f' {a.hold_days}d' if a.exit_mode == 'time' else ''}"
+                        f"{' · SPY<SMA200 only' if a.spy_below_sma200 else ''}"
+                        f"{f' · max {a.max_positions} positions' if a.max_positions else ''}"),
+        "insider_mapping": ins_stats and {k: v for k, v in ins_stats.items() if k != "unmapped_tickers"},
         "portfolio": cs, "trades": trade_stats(trades), "trades_by_kind": kinds,
         "exit_reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
         "benchmarks": {s: benchmark(a.data, s, sim["start"], sim["end"], cs["avg_exposure"])
-                       for s in ("SPY",)},
+                       for s in ("SPY", "MDY") if os.path.exists(os.path.join(a.data, f"{s}.json"))},
         "random_baseline": random_baseline(tick, trades, a, a.sims) if trades else {},
         "sub_periods": subs, "years": by_year(sim["curve"]),
         "events": event_study(tick, a),
